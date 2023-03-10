@@ -149,14 +149,70 @@ def operator_dispatch(
     needs_redistribute = suggested_input_schema is not op_schema
 
     if mesh is not None and mesh.get_coordinate() is None:
-        # if we are on a non-participating device, we simply return
-        # an empty tensor for now.
-        # TODO: what if the op returns a non-tensor value, what if
-        # the op returns a list of tensors, we need to figure out
-        # a consistent way to handle that, and also need to figure
-        # out if we should communicate the result to non-participating
-        # ranks (i.e. a.sum() -> scalar, maybe we should set to 0)
-        local_results = torch.tensor([])
+        # if we are on a non-participating device, we should return
+        # a default value of some type consistent with other
+        # participating devices. This type can be obtained from
+        # the `FunctionSchema` object.
+        def _get_dtype(spec):
+            if spec.tensor_meta is not None:
+                return spec.tensor_meta.dtype
+            else:
+                raise RuntimeError(
+                    f"{spec} has no tensor metadata."
+                )
+
+        def _default_ret_value(arg):
+            # TODO: Replace this dict of primitive date type
+            # default value with a communication
+            _date_type_default_value = {
+                "bool": True,
+                "int": 0,
+                "float": 0.0,
+                "double": 0.0,
+            }
+
+            type_str = str(arg.type)
+            if type_str in _date_type_default_value:
+                return _date_type_default_value[type_str]
+
+            if (
+                (type_str == "Tensor")
+                or (type_str == "torch.Tensor")
+            ):
+                # TODO: how to recover dtype info?
+                return torch.tensor(
+                    [],
+                    dtype=_get_dtype(output_sharding.output_spec),
+                )
+            elif type_str == "List[Tensor]":
+                return [
+                    torch.tensor(
+                        [],
+                        dtype=_get_dtype(spec),
+                    )
+                    for spec in output_sharding.output_spec
+                ]
+            else:
+                # TODO: add more types
+                # Maybe this better be a warning???
+                raise NotImplementedError(
+                    f"default value for type {type_str} on non-participating"
+                    f" device is not implemented."
+                )
+
+        ret_list = op_schema.func_schema.returns
+        if len(ret_list) > 1:
+            # some operators return multiple values e.g. std_mean
+            local_results = [_default_ret_value(arg) for arg in ret_list]
+        elif len(ret_list) == 1:
+            local_results = _default_ret_value(ret_list[0])
+        else:
+            raise RuntimeError(
+                f"function schema {str(op_schema.func_schema)} returns"
+                f" no value"
+            )
+        # TODO: also need to figure out if we should communicate
+        # the result to non-participating ranks
     else:
         # compute locally with redistribute first if needed
         local_tensor_args = pack_args_kwargs_with_local_tensor(
