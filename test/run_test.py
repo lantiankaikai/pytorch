@@ -818,7 +818,8 @@ def get_pytest_args(options):
     pytest_args = [
         "--use-pytest",
         "-vv",
-        "-rfEX"
+        "-rfEX",
+        "-p", "no:xdist",
     ]
     pytest_args.extend(rerun_options)
     return pytest_args
@@ -902,9 +903,6 @@ CUSTOM_HANDLERS = {
 
 
 PYTEST_BLOCKLIST = [
-    "profiler/test_profiler",
-    "dynamo/test_repros",  # skip_if_pytest
-    "dynamo/test_optimizers",  # skip_if_pytest
     "dynamo/test_dynamic_shapes",  # needs change to check_if_enable for disabled test issues
 ]
 
