@@ -400,6 +400,12 @@ inline Tensor wrap_tensor_node(
     }
     options = flat_tensors[0].options().merge_in(options_);
     nt_buffer = at::cat(flat_tensors);
+
+    // Temporarily disable meta if needed to ensure sizes are built as real tensors.
+    auto disable_meta_keyset = c10::impl::tls_local_dispatch_key_set();
+    disable_meta_keyset.included_ = disable_meta_keyset.included_.remove_backend(
+      c10::BackendComponent::MetaBit);
+    c10::impl::ForceDispatchKeyGuard disable_meta_guard(disable_meta_keyset);
     nt_sizes = at::native::stack(sizes);
   }
 
