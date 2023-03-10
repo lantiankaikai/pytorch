@@ -819,7 +819,6 @@ def get_pytest_args(options):
         "--use-pytest",
         "-vv",
         "-rfEX",
-        "-p", "no:xdist",
         "-s",
     ]
     pytest_args.extend(rerun_options)
