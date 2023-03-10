@@ -51,6 +51,9 @@ max_autotune = os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE") == "1"
 # enable searching global and local cache regardless of `max_autotune`
 search_autotune_cache = os.environ.get("TORCHINDUCTOR_SEARCH_AUTOTUNE_CACHE") == "1"
 
+# We will disable creating subprocess for autotuning if this is False
+autotune_in_subproc = os.environ.get("TORCHINDUCTOR_AUTOTUNE_IN_SUBPROC") == "1"
+
 # control store vs recompute heuristic
 # For fanouts, rematearialization can lead to exponential blowup. So, have
 # smaller threshold
