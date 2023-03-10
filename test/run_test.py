@@ -820,6 +820,7 @@ def get_pytest_args(options):
         "-vv",
         "-rfEX",
         "-p", "no:xdist",
+        "-s",
     ]
     pytest_args.extend(rerun_options)
     return pytest_args
@@ -903,6 +904,9 @@ CUSTOM_HANDLERS = {
 
 
 PYTEST_BLOCKLIST = [
+    "profiler/test_profiler",
+    "dynamo/test_repros",  # skip_if_pytest
+    "dynamo/test_optimizers",  # skip_if_pytest
     "dynamo/test_dynamic_shapes",  # needs change to check_if_enable for disabled test issues
 ]
 
@@ -1323,6 +1327,7 @@ def main():
 
     test_directory = str(REPO_ROOT / "test")
     selected_tests = get_selected_tests(options)
+    selected_tests = [x for x in selected_tests if x in PYTEST_BLOCKLIST]
 
     if options.verbose:
         print_to_stderr("Selected tests:\n {}".format("\n ".join(selected_tests)))
@@ -1369,8 +1374,7 @@ def main():
         os.environ['PARALLEL_TESTING'] = '1'
         for test in selected_tests_parallel:
             options_clone = copy.deepcopy(options)
-            if can_run_in_pytest(test):
-                options_clone.pytest = True
+            options_clone.pytest = True
             pool.apply_async(run_test_module, args=(test, test_directory, options_clone), callback=success_callback)
         pool.close()
         pool.join()
@@ -1387,8 +1391,7 @@ def main():
 
         for test in selected_tests_serial:
             options_clone = copy.deepcopy(options)
-            if can_run_in_pytest(test):
-                options_clone.pytest = True
+            options_clone.pytest = True
             err_message = run_test_module(test, test_directory, options_clone)
             if err_message is None:
                 continue
