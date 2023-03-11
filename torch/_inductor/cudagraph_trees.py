@@ -7,18 +7,7 @@ import threading
 import warnings
 import weakref
 from collections import defaultdict
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Generator,
-    Iterable,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-)
-from weakref import ref as WeakRef
+from typing import Any, Callable, Dict, Generator, List, Optional, Sequence, Tuple
 
 import torch.fx
 from torch import Tensor
@@ -38,7 +27,11 @@ from torch._inductor.compile_fx import (
 )
 from torch._prims_common import check
 
+from torch.multiprocessing.reductions import StorageWeakRef
+
 from torch.utils import _pytree as pytree
+
+StorageWeakRefPointer = int
 from . import config
 
 
@@ -73,9 +66,11 @@ class TreeManagerContainer:
     -  We generate a bunch of functions, calling add_strong_reference
     -  These functions die, calling finalize_reference
     -  When all the functions die, we finalize_tree_manager.
-    -  We look for all the live tensors and add references to THOSE
-    -  We count as tensors die
-    -  All the tensors are dead, we deallocate the tree manager
+
+    TODO: in the future, we would like to do the following once storage weak refs land
+    -  We look for all the live storages and add references to THOSE
+    -  We count as storages die
+    -  All the storages are dead, we deallocate the tree manager
     """
 
     def __init__(self):
@@ -90,15 +85,15 @@ class TreeManagerContainer:
         # Following two objects are only set in the case that Tensor outputs outlive
         # the cudagraphify_fns. Reference to the Graph is needed to keep the private pool from
         # deallocation.
-        self.live_tensors_count = 0
+        self.live_storages_count = 0
         self.graph: Optional[torch.cuda.CUDAGraph] = None
 
         self.lock = threading.Lock()
 
     def _finalize_tensor(self):
         with self.lock:
-            self.live_tensors_count -= 1
-            if self.live_tensors_count == 0:
+            self.live_storages_count -= 1
+            if self.live_storages_count == 0:
                 self.graph = None
 
                 # manager was used again after existing cleanup,
@@ -114,22 +109,27 @@ class TreeManagerContainer:
 
     def _finalize_tree_manager(self):
         assert self.lock.locked()
-        tree_manager = self.tree_manager
+        self.tree_manager = None
 
-        live_tensors = list(
-            tree_manager.live_cudagraph_pool_tensors_in_curr_execution()
-        )
-        if not live_tensors:
-            self.tree_manager = None
-            return
+        # TODO - when issue #91395 is landed, we can set a weakref on
+        # storages and trigger a deallocation when all outputs of the
+        # cudagraph are dead.
 
-        # Maintain reference to graph to keep tensors alive
-        assert len(tree_manager.roots) > 0, "expected at least one use"
-        root = next(tree_manager.get_roots())
-        self.graph = root.graph
-        for t in live_tensors:
-            self.live_tensors_count += 1
-            weakref.finalize(t, self._finalize_tensor)
+        # live_storages = list(
+        #     tree_manager.live_cudagraph_pool_storages_in_curr_execution()
+        # )
+
+        # # Maintain reference to graph to keep tensors alive
+        # assert len(tree_manager.roots) > 0, "expected at least one use"
+        # root = next(tree_manager.get_roots())
+        # self.graph = root.graph
+        # seen_storages = set()
+        # for stor in live_storages:
+        #     if stor in seen_storages:
+        #         continue
+        #     seen_storages.add(stor)
+        #     self.live_storages_count += 1
+        # .   weakref.finalize(stor, self._finalize_tensor)
 
     def add_strong_reference(self, fn: Callable):
         with self.lock:
@@ -152,6 +152,12 @@ local.tree_manager_container = TreeManagerContainer()
 torch._C._stash_obj_in_tls("tree_manager_container", local.tree_manager_container)
 
 
+# See [Deleter Fn Swapping on Reconstructed Tensors], not working yet
+def call_storage_dealloc(data_ptr):
+    print("BEING CALLED", data_ptr)
+    # assert False
+
+
 def get_container():
     if hasattr(local, "tree_manager_container"):
         return local.tree_manager_container
@@ -170,25 +176,39 @@ def is_live(weak_ref):
     return weak_ref() is not None
 
 
-class TensorWeakRef:
+class StorageWeakRefWrapper:
     """
-    Wrapper around a weak ref of a Tensor that handles the _fix_weakref() call required
-    when unwrapping a Tensor weakref.
+    Wrapper around a storage weak ref of a Tensor will deallocate it upon
+    expiration if invoked.
     """
 
-    ref: WeakRef[Tensor]
+    storage_ref: Optional[StorageWeakRef]
 
     def __init__(self, tensor: Tensor):
         assert isinstance(tensor, Tensor)
-        self.ref = weakref.ref(tensor)
+        stor = tensor.untyped_storage()
+        self.ref = StorageWeakRef(stor)
+        self.data_ptr = stor.data_ptr()
 
-    def __call__(self):
-        out = self.ref()
-        if out is None:
-            return out
-        assert isinstance(out, Tensor)
-        out._fix_weakref()
-        return out
+    def __call__(self) -> Optional[StorageWeakRefPointer]:
+        if self.ref is None:
+            return None
+
+        if self.ref.expired():
+            self.ref = None
+            return None
+
+        return self.ref.cdata
+
+    def data_ptr(self) -> int:
+        "NB: returns the data ptr even if the storage has expired"
+        return self.data_ptr()
+
+    def __repr__(self):
+        if self.ref is None or self.ref.expired():
+            return f"StorageWeakRefWrapper to {self.data_ptr}; dead"
+        else:
+            return f"StorageWeakRefWrapper to {self.data_ptr}; alive"
 
 
 def is_cuda_tensor(x):
@@ -243,8 +263,8 @@ class CUDAGraphNode:
         # in children to avoid children having to chase parent pointers in the hot path
         # DO NOT reassign output_weakrefs, only call `clear()`
         # Path is a series of nodes from root to the current node
-        self.outputs_weakrefs: List[Optional[TensorWeakRef]] = []
-        self.path_weakrefs: List[List[Optional[TensorWeakRef]]] = [
+        self.outputs_weakrefs: List[Optional[StorageWeakRefWrapper]] = []
+        self.path_weakrefs: List[List[Optional[StorageWeakRefWrapper]]] = [
             node.outputs_weakrefs for node in self._path_from_root
         ]
 
@@ -441,11 +461,11 @@ class CUDAGraphNode:
             self.outputs_weakrefs.append(self._map_to_ref(out))
 
     @staticmethod
-    def _map_to_ref(t: Optional[Tensor]) -> Optional[TensorWeakRef]:
+    def _map_to_ref(t: Optional[Tensor]) -> Optional[StorageWeakRefWrapper]:
         if not isinstance(t, torch.Tensor):
             assert t is None
             return None
-        return TensorWeakRef(t)
+        return StorageWeakRefWrapper(t)
 
     @property
     def parent(self):
@@ -470,14 +490,13 @@ class CUDAGraphNode:
     def _is_cuda_graph_recorded_tensor(self, t: torch.Tensor):
         "Is this tensor an output of a node in this path"
         for output_refs in self.path_weakrefs:
-            for tensor_ref in output_refs:
-                tensor = tensor_ref()
-                if tensor is None:
+            for storage_weak_ref in output_refs:
+                if storage_weak_ref is None:
                     continue
-                if (
-                    tensor.untyped_storage().data_ptr()
-                    == t.untyped_storage().data_ptr()
-                ):
+                # dont need to check liveness of storage since the cuda graph managed
+                # memory is never released.
+                data_ptr = storage_weak_ref.data_ptr
+                if t.untyped_storage().data_ptr() == data_ptr:
                     return True
 
         return False
@@ -511,7 +530,7 @@ class CUDAGraphNode:
 
     @staticmethod
     def _get_liveness(
-        weakrefs: List[List[Optional[TensorWeakRef]]],
+        weakrefs: List[List[Optional[StorageWeakRefWrapper]]],
     ) -> List[List[bool]]:
         "Maps weakrefs to true if the reference is alive and false otherwise"
         if len(weakrefs) == 0:
@@ -536,11 +555,11 @@ class CUDAGraphNode:
 
         return ptrs_to_deallocate
 
-    def path_live_weakrefs(self) -> Iterable[WeakRef[Tensor]]:
-        for outputs in self.path_weakrefs:
-            for out in outputs:
-                if is_live(out):
-                    yield out
+    def path_live_weakrefs(self) -> Generator[StorageWeakRefWrapper]:
+        for (i, j) in self.live_indices_after_graph:
+            out = self.path_weakrefs[i][j]
+            if is_live(out):
+                yield out
 
     def clear_path_outputs(self):
         "Clear the output lists of all nodes in the path"
@@ -658,8 +677,8 @@ def get_cudagraph_segments(pool_id):
     return [segment for segment in segments if segment["segment_pool_id"] == pool_id]
 
 
-def check_memory_pool(pool_id, live_tensors):
-    unique_storages = {t.untyped_storage().data_ptr() for t in live_tensors}
+def check_memory_pool(pool_id, live_storages_ptrs: List[StorageWeakRefPointer]):
+    unique_storages = {stor.data_ptr for stor in live_storages_ptrs if stor()}
     segments = get_cudagraph_segments(pool_id)
 
     for segment in segments:
@@ -724,8 +743,6 @@ class CUDAGraphTreeManager:
 
         # whether we currently have a current node which is in the middle of recording
         self.in_recording = False
-        # previous_recording_outputs will be removed in next stack
-        self.previous_recording_outputs: List[TensorWeakRef] = []
 
         # number of instances we are in execution and failed to match to an
         # existing child
@@ -836,11 +853,12 @@ class CUDAGraphTreeManager:
 
         # multiple invocations, allow overwriting the previous generation
         if self.current_gen != self.get_curr_generation():
-            # we need to keep track of the previous live outputs if they were in recording
-            # in case we need to record again
-            self.previous_recording_outputs.extend(
-                self.current_node.path_live_weakrefs()
-            )
+
+            # TODO: we could also allow the these weak refs to continue to be allocated,
+            # but that adds some complications.
+            for t in self.current_node.path_live_weakrefs():
+                if t():
+                    torch._C._free_And_Remove_DeleterFn(t())
 
             self.clear_current_node_outputs_and_set_to_none()
             self.in_recording = False
@@ -883,13 +901,14 @@ class CUDAGraphTreeManager:
         device = self.current_node.device
         assert state is not None and device is not None
 
-        stale_tensors = [t() for t in self.previous_recording_outputs if is_live(t)]
-        self.previous_recording_outputs = []
+        # currently we deallocate on instead of allowing stale recordings
+        stale_storages = []
+        live_storages_wrappers = list(self.current_node.path_live_weakrefs())
 
-        live_tensors = [t() for t in self.current_node.path_live_weakrefs()]
+        live_storages_weak_refs = [t() for t in live_storages_wrappers]
         ptrs_to_deallocate = self.current_node.data_ptrs_dead_since_invocation()
         torch._C._cuda_setCheckpointPoolState(
-            device, state, stale_tensors, live_tensors
+            device, state, stale_storages, live_storages_weak_refs
         )
 
         for ptr in ptrs_to_deallocate:
@@ -897,9 +916,11 @@ class CUDAGraphTreeManager:
 
         # Now the live blocks should be exactly equal to the live storages in private pool
         if config.triton.debug_cudagraph_trees:
-            check_memory_pool(self.cuda_graphs_thread_pool, live_tensors)
+            check_memory_pool(self.cuda_graphs_thread_pool, live_storages_wrappers)
 
-    def live_cudagraph_pool_tensors_in_curr_execution(self) -> List[Tensor]:
+    def live_cudagraph_pool_storages_in_curr_execution(
+        self,
+    ) -> List[StorageWeakRefPointer]:
         if self.current_node is None:
             return []
         # explicitly ignoring previous recorded outputs from past path
