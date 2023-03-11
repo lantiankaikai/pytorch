@@ -178,6 +178,11 @@ class triton:
     # Use cudagraphs on output code
     cudagraphs = False
 
+    # Use cudagraph trees for memory pooling if `cudagraphs` is True
+    cudagraph_trees = False
+
+    debug_cudagraph_trees = True
+
     # Synchronize before and after every compiled graph.
     debug_sync_graph = False
 
