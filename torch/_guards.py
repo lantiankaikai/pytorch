@@ -5,7 +5,7 @@ import logging
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Callable, Generic, List, NamedTuple, Optional, Set, TypeVar
+from typing import Callable, Dict, Generic, List, NamedTuple, Optional, Set, TypeVar
 
 log = logging.getLogger(__name__)
 
@@ -188,6 +188,27 @@ class Guard:
         self.obj_weakref = obj_weakref
 
 
+# Subclasses can be found in torch/_dynamo/source.py
+@dataclasses.dataclass
+class Source:
+    def reconstruct(self, codegen):
+        raise NotImplementedError()
+
+    def guard_source(self) -> GuardSource:
+        raise NotImplementedError()
+
+    def name(self) -> str:
+        raise NotImplementedError()
+
+    def make_guard(self, fn, is_volatile=False) -> Guard:
+        if self.guard_source() is GuardSource.CONSTANT:
+            raise NotImplementedError()
+        return Guard(self.name(), self.guard_source(), fn, is_volatile)
+
+    def is_nn_module(self) -> bool:
+        return self.guard_source().is_nn_module()
+
+
 T = TypeVar("T")
 
 """
@@ -269,6 +290,31 @@ class GuardsCheckpointState:
         return self.diff(other) is None
 
 
+class ModuleCheckpointState:
+    names_to_sources: Dict[str, Source]
+
+    def __init__(self, names_to_sources):
+        self.names_to_sources = names_to_sources
+
+    """
+    Produces a delta against another ModuleCheckpointState.
+
+    Returns None if no delta is found, otherwise, return a set() of mismatched
+    attr and parameter names.
+    """
+
+    def diff(self, other):
+        original_keys = set(self.names_to_sources.keys())
+        other_keys = set(other.names_to_sources.keys())
+        r = original_keys.difference(original_keys)
+        if len(r) == 0:
+            return None
+        return r
+
+    def __eq__(self, other):
+        return self.diff(other) is None
+
+
 """
 A GuardsContext is a checkpointable representation of all the guards in the current tracing
 context. It's lifecycle is bound 1:1 to the tracing context, and it should never be instantiated
@@ -288,6 +334,44 @@ class GuardsContext(Checkpointable[GuardsCheckpointState]):
     def restore_graphstate(self, state):
         assert isinstance(state, GuardsCheckpointState)
         self.dynamo_guards = state.dynamo_guards
+
+
+class ModuleContext(Checkpointable[ModuleCheckpointState]):
+    def __init__(self):
+        self.names_to_sources: Dict[str, Source] = dict()
+
+    def copy_graphstate(self):
+        return ModuleCheckpointState(dict(self.names_to_sources))
+
+    def restore_graphstate(self, state):
+        assert isinstance(state, ModuleCheckpointState)
+        self.names_to_sources = state.names_to_sources
+
+    def register(self, name: str, source: Source):
+        """
+        Registers a source object.
+
+        :param name: A name to register under. When in doubt, the source name can be used,
+        but do note that the source name's role is to be used for eval() to get to the original
+        argument. Ex: getattr(foo, 'bar')[0].baz[0].weight is a viable source name, but unfit for
+        keying. This function will make any passed in name unique to the current state of the trace.
+        :type name: str
+
+        :param source: A Source object representing the source to be registered.
+        :type source: Source
+
+        :raises AssertionError: If a source with the same name already exists but has a different source name.
+
+        :return: The new unique name.
+        """
+        from torch._dynamo.utils import unique_normalized_attr_name
+
+        name = unique_normalized_attr_name(name)
+        if name in self.names_to_sources:
+            breakpoint()
+            raise AssertionError("Illegal, unreachable state. ")
+        self.names_to_sources[name] = source
+        return name
 
 
 _CURRENT_TRACING_CONTEXT = None
@@ -327,6 +411,7 @@ class TracingContext:
         self.guards_context = GuardsContext()
         self.fake_mode = fake_mode
         self.frame_summary_stack = []
+        self.module_context = ModuleContext()
 
     @staticmethod
     @contextlib.contextmanager
@@ -358,24 +443,3 @@ def tracing(context: TracingContext):
         yield _CURRENT_TRACING_CONTEXT
     finally:
         _CURRENT_TRACING_CONTEXT = old_context
-
-
-# Subclasses can be found in torch/_dynamo/source.py
-@dataclasses.dataclass
-class Source:
-    def reconstruct(self, codegen):
-        raise NotImplementedError()
-
-    def guard_source(self) -> GuardSource:
-        raise NotImplementedError()
-
-    def name(self) -> str:
-        raise NotImplementedError()
-
-    def make_guard(self, fn, is_volatile=False) -> Guard:
-        if self.guard_source() is GuardSource.CONSTANT:
-            raise NotImplementedError()
-        return Guard(self.name(), self.guard_source(), fn, is_volatile)
-
-    def is_nn_module(self) -> bool:
-        return self.guard_source().is_nn_module()
