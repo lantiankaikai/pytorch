@@ -195,6 +195,24 @@ def guard_scalar(a):
 
 # inclusive both ways
 def constrain_range(a, *, min: Optional[int], max: Optional[int] = None):
+    """
+    Constrain range takes a symbol, and records a valid value range for it in the graph.
+    That value range is the narrowest intersection of the current value range for the symbol.
+
+    Ex:
+    constrain_range(x, min=3, max=10)
+    constrain_range(x, min=4, max=12)
+
+    Would have a range of (4, 10)
+
+    min and max are optional, and not specifying one will leave the range unbounded, but
+    still constrained to any past min or maxes, as in the comment above.
+
+    In this way, it is a one directional api - it can only constrain ranges for a shape further.
+
+    Setting this flag records the range into the user_constrained field on shape_env. See the docs on that field
+    for more information.
+    """
     if min is None:
         min = -sympy.oo
     if max is None:
@@ -1191,6 +1209,8 @@ class ShapeEnv:
         allow_dynamic_output_shape_ops=True,
         strict_mark_dyn=False,
         assume_static_by_default=False,
+        # Note - On 0/1 specialization
+        #
         # The following options affect decisions we make about eager
         # specialization.  Disabling them will increase trace time (as we do
         # more symbolic reasoning) and can also harm the quality of generated
@@ -1307,6 +1327,14 @@ class ShapeEnv:
                 )
         assert all(x is not None for x in stride)
         sym_size = [self.create_symintnode(i, hint=hint) for i, hint in zip(size, ex.size())]
+
+        for i, syms in enumerate(sym_size):
+            is_dynamic = _is_dim_dynamic(ex, i)
+            if is_dynamic:
+                constraint = _dynamic_dim_range(ex, i)
+                if constraint != MinMaxConstraint.NONE():
+                    constrain_range(syms, min=constraint.min, max=constraint.max)
+
         sym_stride = []
         for i, stride_expr in enumerate(stride):
             # NB: Don't duck size the stride; instead use the expression
@@ -1360,11 +1388,7 @@ class ShapeEnv:
                 self.val_to_var[val] = sympy_expr
 
             # We also infer that it must be not 0/1
-            lower = 2 if self.specialize_zero_one else 0
-            # NB: sys.maxsize is NOT allowed for sizes, because we use MAX_INT
-            # as a sentinel sometimes.  Your sizevar isn't going to be
-            # anywhere near the max 64-bit integer anyway.
-            self.var_to_range[sympy_expr] = ValueRanges(lower, sys.maxsize - 1)
+            self.var_to_range[sympy_expr] = _default_value_range(specialize_zero_one=self.specialize_zero_one)
 
         if not dyn and self.duck_shape:
             # This implements duck-shaping: input sizes that match are assigned
@@ -1511,10 +1535,23 @@ class ShapeEnv:
             # user directives about relationships, we can remove this check from
             # verification.
             if len(expr.free_symbols) == 1:
-                srcs = symbol_to_source[expr.free_symbols.pop()]
+                symbol = expr.free_symbols.pop()
+                # NOTE! Manual user directives override the rule around not allowing any constraining of dynamic dims
+                # [NOTE - on user_constrained]
+                # User constrained symbols have an entry in var_to_range, but some of their range
+                # comes from manual user directives like dynamo's constrain api. This distinction is maintained
+                # for the purposes of protecting and enforcing user directives. In strict_mark_dyn mode, we do not
+                # allow ANY constraining of values for a given symbol. However, if this symbol is user constrained, we
+                # relax this requirement in favor of honoring the user directive and allowing the user specified range.
+                # We do this by checking of the range is unconstrained*.
+                #
+                # *unconstrained might mean a default unsound 0/1 constraint.
+                if self.var_to_range[symbol] != _default_value_range(specialize_zero_one=self.specialize_zero_one):
+                    return
+                srcs = symbol_to_source[symbol]
                 for src in srcs:
                     if src in dynamic_sources:
-                        raise RuntimeError(f"Attempting to introduce a guard {potential_expr} that violates user's mark_dynamic")
+                        raise RuntimeError(f"Attempting to introduce a guard {potential_expr} that violates user's mark_dynamic")  # noqa: B950
 
         for t, source in zip(placeholders, sources):
             if isinstance(source, str):
@@ -1686,6 +1723,8 @@ class ShapeEnv:
         new_range_env = {}
         for idx, k in enumerate(symbols):
             vr = self.var_to_range[k]
+            if vr != _default_value_range(specialize_zero_one=self.specialize_zero_one):
+                self._verify_valid_range(k, vr, expr)
             # Don't do anything if we don't have a nontrivial lower bound
             # Also don't do anything if we asked only to simplify unbacked
             # SymInt
@@ -1885,6 +1924,13 @@ class ShapeEnv:
             self.evaluate_expr(eq_expr)
         return self.simplify(expr)
 
+    def _verify_valid_range(self, symbol, valid_range, expr):
+        if symbol not in self.var_to_val:
+            return
+        if has_hint(symbol) and self.size_hint(symbol) not in valid_range:
+            raise RuntimeError(f"Valid range, {valid_range}, contradicts "
+                               f"traced value of {symbol}, {self.size_hint(symbol)}")
+
     @lru_cache(256)
     def evaluate_expr(self, expr: "sympy.Expr", hint=None):
         """
@@ -1955,9 +2001,42 @@ def _should_allocate(user_marked_dynamic, assume_static_by_default):
 def _is_dim_dynamic(t, d):
     return hasattr(t, "_dynamo_dynamic_indices") and d in t._dynamo_dynamic_indices
 
+class MinMaxConstraint:
+    min: Optional[Union[int, sympy.core.numbers.NegativeInfinity]]
+    max: Optional[Union[int, sympy.core.numbers.Infinity]]
+
+    def __init__(self, min=None, max=None):
+        self.min = min if min else -sympy.oo
+        self.max = max if max else sympy.oo
+        assert self.min < self.max, f"Illegal intersection produced! {self.min} < {self.max}"
+
+    @staticmethod
+    def NONE():
+        return MinMaxConstraint(min=-sympy.oo, max=sympy.oo)
+
+    def __repr__(self):
+        return f"({self.min}, {self.max})"
+
+    def __eq__(self, other):
+        return self.min == other.min and self.max == other.max
+
+
+def _dynamic_dim_range(t, d) -> MinMaxConstraint:
+    assert _is_dim_dynamic(t, d)
+    return t._dynamo_dynamic_indices[d]
+
+
 def _is_int(expr):
     if not isinstance(expr, SymInt):
         return False
     if len(expr.node.expr.free_symbols) > 0:
         return False
     return True
+
+# See: Note - On 0/1 specialization
+# NB: sys.maxsize is NOT allowed for sizes, because we use MAX_INT
+# as a sentinel sometimes.  Your sizevar isn't going to be
+# anywhere near the max 64-bit integer anyway.
+def _default_value_range(*, specialize_zero_one: bool) -> ValueRanges:
+    lower = 2 if specialize_zero_one else 0
+    return ValueRanges(lower, sys.maxsize - 1)
